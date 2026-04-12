@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
@@ -612,7 +612,7 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     AUDIO_DIR.mkdir(exist_ok=True)
-    server = HTTPServer((HOST, PORT), VerseRequestHandler)
+    server = ThreadingHTTPServer((HOST, PORT), VerseRequestHandler)
     print(f"Web-App gestartet: http://{HOST}:{PORT}")
     server.serve_forever()
 
