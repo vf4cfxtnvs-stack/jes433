@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import importlib.util
 import os
 import subprocess
 import sys
+import threading
 import time
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-from uuid import uuid4
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,6 +30,10 @@ PIPER_MODEL_PATH = Path(
     )
 )
 PIPER_CONFIG_PATH = Path(f"{PIPER_MODEL_PATH}.json")
+_PIPER_VOICE = None
+_PIPER_SYN_CONFIG = None
+_PIPER_LOAD_LOCK = threading.Lock()
+_PIPER_SYNTHESIS_LOCK = threading.Lock()
 
 
 def personalize_verse(first_name: str) -> str:
@@ -65,6 +71,37 @@ def find_piper_runner() -> tuple[list[str] | None, str]:
     return (None, "")
 
 
+def current_process_has_piper() -> bool:
+    return importlib.util.find_spec("piper") is not None
+
+
+def load_piper_voice():
+    global _PIPER_VOICE, _PIPER_SYN_CONFIG
+
+    if not current_process_has_piper():
+        return None, None
+
+    with _PIPER_LOAD_LOCK:
+        if (_PIPER_VOICE is None) or (_PIPER_SYN_CONFIG is None):
+            from piper import PiperVoice, SynthesisConfig
+
+            _PIPER_VOICE = PiperVoice.load(
+                PIPER_MODEL_PATH,
+                config_path=PIPER_CONFIG_PATH,
+            )
+            _PIPER_SYN_CONFIG = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
+
+    return _PIPER_VOICE, _PIPER_SYN_CONFIG
+
+
+def warm_piper_voice() -> None:
+    try:
+        load_piper_voice()
+    except Exception:
+        # If preloading fails, the request path will show the actual error later.
+        return
+
+
 def get_piper_status() -> tuple[bool, str]:
     runner, runner_label = find_piper_runner()
     if runner is None:
@@ -89,7 +126,8 @@ def get_piper_status() -> tuple[bool, str]:
         True,
         (
             "Piper ist aktiv mit dem Modell "
-            f"{PIPER_MODEL_PATH.name} ueber {runner_label}. "
+            f"{PIPER_MODEL_PATH.name} ueber "
+            f"{'eingebettete Piper-API' if current_process_has_piper() else runner_label}. "
             f"Tempo={PIPER_LENGTH_SCALE}, Satzpause={PIPER_SENTENCE_SILENCE}s."
         ),
     )
@@ -102,16 +140,61 @@ def cleanup_audio_cache(max_files: int = 12) -> None:
         stale_file.unlink(missing_ok=True)
 
 
+def build_audio_name(text: str) -> str:
+    cache_key = "|".join(
+        [
+            PIPER_MODEL_PATH.name,
+            str(PIPER_LENGTH_SCALE),
+            str(PIPER_SENTENCE_SILENCE),
+            text,
+        ]
+    )
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
+    return f"{digest}.wav"
+
+
+def synthesize_with_embedded_piper(text: str, output_path: Path) -> None:
+    voice, syn_config = load_piper_voice()
+    if (voice is None) or (syn_config is None):
+        raise RuntimeError("Die eingebettete Piper-API ist nicht verfuegbar.")
+
+    silence_bytes = bytes(int(voice.config.sample_rate * PIPER_SENTENCE_SILENCE * 2))
+
+    with _PIPER_SYNTHESIS_LOCK:
+        wav_file = wave.open(str(output_path), "wb")
+        with wav_file:
+            wav_params_set = False
+            for i, audio_chunk in enumerate(voice.synthesize(text, syn_config=syn_config)):
+                if not wav_params_set:
+                    wav_file.setframerate(audio_chunk.sample_rate)
+                    wav_file.setsampwidth(audio_chunk.sample_width)
+                    wav_file.setnchannels(audio_chunk.sample_channels)
+                    wav_params_set = True
+
+                if i > 0 and silence_bytes:
+                    wav_file.writeframes(silence_bytes)
+
+                wav_file.writeframes(audio_chunk.audio_int16_bytes)
+
+
 def synthesize_with_piper(text: str) -> str:
     runner, _runner_label = find_piper_runner()
     if runner is None:
         raise RuntimeError("Piper ist nicht installiert oder nicht auffindbar.")
 
     AUDIO_DIR.mkdir(exist_ok=True)
+    output_name = build_audio_name(text)
+    output_path = AUDIO_DIR / output_name
+    if output_path.exists() and output_path.stat().st_size > 0:
+        output_path.touch()
+        cleanup_audio_cache()
+        return output_name
+
     cleanup_audio_cache()
 
-    output_name = f"{int(time.time())}-{uuid4().hex[:10]}.wav"
-    output_path = AUDIO_DIR / output_name
+    if current_process_has_piper():
+        synthesize_with_embedded_piper(text, output_path)
+        return output_name
 
     result = subprocess.run(
         [
@@ -612,6 +695,8 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     AUDIO_DIR.mkdir(exist_ok=True)
+    if current_process_has_piper():
+        threading.Thread(target=warm_piper_voice, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), VerseRequestHandler)
     print(f"Web-App gestartet: http://{HOST}:{PORT}")
     server.serve_forever()
