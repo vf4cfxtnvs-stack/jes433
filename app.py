@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -33,7 +34,10 @@ PIPER_CONFIG_PATH = Path(f"{PIPER_MODEL_PATH}.json")
 _PIPER_VOICE = None
 _PIPER_SYN_CONFIG = None
 _PIPER_LOAD_LOCK = threading.Lock()
-_PIPER_SYNTHESIS_LOCK = threading.Lock()
+_PIPER_SYNTHESIS_LOCK = threading.RLock()
+_AUDIO_JOB_LOCK = threading.Lock()
+_PENDING_AUDIO_JOBS: set[str] = set()
+_AUDIO_JOB_ERRORS: dict[str, str] = {}
 
 
 def personalize_verse(first_name: str) -> str:
@@ -153,6 +157,41 @@ def build_audio_name(text: str) -> str:
     return f"{digest}.wav"
 
 
+def get_audio_path(audio_name: str) -> Path:
+    return AUDIO_DIR / audio_name
+
+
+def is_audio_ready(audio_name: str) -> bool:
+    audio_path = get_audio_path(audio_name)
+    return audio_path.exists() and audio_path.stat().st_size > 0
+
+
+def mark_audio_error(audio_name: str, message: str) -> None:
+    with _AUDIO_JOB_LOCK:
+        _AUDIO_JOB_ERRORS[audio_name] = message
+
+
+def clear_audio_error(audio_name: str) -> None:
+    with _AUDIO_JOB_LOCK:
+        _AUDIO_JOB_ERRORS.pop(audio_name, None)
+
+
+def get_audio_job_state(audio_name: str) -> tuple[str, str]:
+    if is_audio_ready(audio_name):
+        return ("ready", "")
+
+    with _AUDIO_JOB_LOCK:
+        if audio_name in _PENDING_AUDIO_JOBS:
+            return ("pending", "")
+
+        error_message = _AUDIO_JOB_ERRORS.get(audio_name, "")
+
+    if error_message:
+        return ("error", error_message)
+
+    return ("pending", "")
+
+
 def synthesize_with_embedded_piper(text: str, output_path: Path) -> None:
     voice, syn_config = load_piper_voice()
     if (voice is None) or (syn_config is None):
@@ -184,41 +223,55 @@ def synthesize_with_piper(text: str) -> str:
 
     AUDIO_DIR.mkdir(exist_ok=True)
     output_name = build_audio_name(text)
-    output_path = AUDIO_DIR / output_name
-    if output_path.exists() and output_path.stat().st_size > 0:
-        output_path.touch()
+    output_path = get_audio_path(output_name)
+    temp_output_path = output_path.with_name(f"{output_path.stem}.partial.wav")
+
+    with _PIPER_SYNTHESIS_LOCK:
+        if output_path.exists() and output_path.stat().st_size > 0:
+            output_path.touch()
+            cleanup_audio_cache()
+            return output_name
+
         cleanup_audio_cache()
-        return output_name
+        temp_output_path.unlink(missing_ok=True)
 
-    cleanup_audio_cache()
+        try:
+            if current_process_has_piper():
+                synthesize_with_embedded_piper(text, temp_output_path)
+            else:
+                result = subprocess.run(
+                    [
+                        *runner,
+                        "--model",
+                        str(PIPER_MODEL_PATH),
+                        "--output_file",
+                        str(temp_output_path),
+                        "--length-scale",
+                        str(PIPER_LENGTH_SCALE),
+                        "--sentence-silence",
+                        str(PIPER_SENTENCE_SILENCE),
+                    ],
+                    input=text,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
 
-    if current_process_has_piper():
-        synthesize_with_embedded_piper(text, output_path)
-        return output_name
+                if result.returncode != 0:
+                    details = (result.stderr or result.stdout or "Unbekannter Piper-Fehler").strip()
+                    raise RuntimeError(details)
 
-    result = subprocess.run(
-        [
-            *runner,
-            "--model",
-            str(PIPER_MODEL_PATH),
-            "--output_file",
-            str(output_path),
-            "--length-scale",
-            str(PIPER_LENGTH_SCALE),
-            "--sentence-silence",
-            str(PIPER_SENTENCE_SILENCE),
-        ],
-        input=text,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+            if (not temp_output_path.exists()) or temp_output_path.stat().st_size == 0:
+                raise RuntimeError("Piper hat keine gueltige Audiodatei erzeugt.")
 
-    if result.returncode != 0:
-        output_path.unlink(missing_ok=True)
-        details = (result.stderr or result.stdout or "Unbekannter Piper-Fehler").strip()
-        raise RuntimeError(details)
+            temp_output_path.replace(output_path)
+        except Exception as error:
+            temp_output_path.unlink(missing_ok=True)
+            if isinstance(error, RuntimeError):
+                raise
+            raise RuntimeError(str(error)) from error
 
+    clear_audio_error(output_name)
     return output_name
 
 
@@ -234,6 +287,7 @@ def build_page(
     first_name: str = "",
     personalized_text: str = "",
     audio_name: str = "",
+    audio_pending: bool = False,
     piper_ready: bool = False,
     piper_status: str = "",
     synthesis_error: str = "",
@@ -246,7 +300,8 @@ def build_page(
 
     status_class = "ok" if piper_ready else "warn"
     audio_block = ""
-    if audio_name:
+    audio_status_block = ""
+    if audio_name and not audio_pending:
         safe_audio_name = html.escape(audio_name)
         audio_block = f"""
         <div class="audio-card">
@@ -256,6 +311,13 @@ def build_page(
             <button type="button" onclick="playAudio()">Noch einmal abspielen</button>
             <button type="button" class="secondary" onclick="stopAudio()">Wiedergabe stoppen</button>
           </div>
+        </div>
+        """
+    elif audio_name and audio_pending:
+        audio_status_block = """
+        <div id="audio-status" class="status warn audio-status">
+          <strong>Audio wird vorbereitet</strong>
+          <p>Dein Text ist schon da. Die Stimme wird jetzt im Hintergrund erzeugt.</p>
         </div>
         """
 
@@ -283,7 +345,8 @@ def build_page(
         <section class="result" aria-live="polite">
           <span class="reference">{VERSE_REFERENCE}</span>
           <p id="personalized-verse" class="verse">{safe_personalized_text}</p>
-          {audio_block}
+          {audio_status_block}
+          <div id="audio-container">{audio_block}</div>
         </section>
         """
 
@@ -452,6 +515,11 @@ def build_page(
         border-top: 1px solid rgba(123, 75, 42, 0.16);
       }}
 
+      .audio-status {{
+        margin-top: 22px;
+        margin-bottom: 0;
+      }}
+
       .audio-label {{
         margin-bottom: 10px;
         color: var(--muted);
@@ -539,10 +607,60 @@ def build_page(
     </main>
 
     <script>
-      const shouldAutoplay = {str(bool(audio_name)).lower()};
+      const initialAudioName = {json.dumps(audio_name)};
+      const initialAudioReady = {str(bool(audio_name and not audio_pending)).lower()};
+      const shouldAutoplay = initialAudioReady;
+      const shouldPollForAudio = {str(bool(audio_name and audio_pending)).lower()};
+      const audioStatusUrl = initialAudioName ? `/audio-status/${{encodeURIComponent(initialAudioName)}}` : "";
 
       function getPlayer() {{
         return document.getElementById("piper-player");
+      }}
+
+      function getAudioContainer() {{
+        return document.getElementById("audio-container");
+      }}
+
+      function getAudioStatus() {{
+        return document.getElementById("audio-status");
+      }}
+
+      function buildAudioCard(audioName) {{
+        return `
+          <div class="audio-card">
+            <p class="audio-label">Piper-Audio</p>
+            <audio id="piper-player" controls preload="auto" src="/audio/${{encodeURIComponent(audioName)}}"></audio>
+            <div class="actions">
+              <button type="button" onclick="playAudio()">Noch einmal abspielen</button>
+              <button type="button" class="secondary" onclick="stopAudio()">Wiedergabe stoppen</button>
+            </div>
+          </div>
+        `;
+      }}
+
+      function setAudioStatus(kind, title, message) {{
+        const status = getAudioStatus();
+        if (!status) {{
+          return;
+        }}
+
+        status.className = `status audio-status ${{kind}}`;
+        status.innerHTML = `<strong>${{title}}</strong><p>${{message}}</p>`;
+      }}
+
+      function mountAudio(audioName) {{
+        const container = getAudioContainer();
+        if (!container) {{
+          return;
+        }}
+
+        container.innerHTML = buildAudioCard(audioName);
+        const status = getAudioStatus();
+        if (status) {{
+          status.remove();
+        }}
+
+        setTimeout(playAudio, 250);
       }}
 
       function playAudio() {{
@@ -567,15 +685,82 @@ def build_page(
         player.currentTime = 0;
       }}
 
+      async function pollAudioStatus() {{
+        if (!audioStatusUrl) {{
+          return;
+        }}
+
+        try {{
+          const response = await fetch(audioStatusUrl, {{ cache: "no-store" }});
+          if (!response.ok) {{
+            throw new Error("Status konnte nicht geladen werden.");
+          }}
+
+          const data = await response.json();
+          if (data.status === "ready") {{
+            mountAudio(data.audio_name || initialAudioName);
+            return;
+          }}
+
+          if (data.status === "error") {{
+            setAudioStatus(
+              "error",
+              "Audio konnte nicht erzeugt werden",
+              data.message || "Bitte versuche es gleich noch einmal."
+            );
+            return;
+          }}
+        }} catch (_error) {{
+          // Der naechste Poll versucht es einfach noch einmal.
+        }}
+
+        window.setTimeout(pollAudioStatus, 1200);
+      }}
+
       window.addEventListener("load", () => {{
         if (shouldAutoplay) {{
           setTimeout(playAudio, 250);
+        }}
+
+        if (shouldPollForAudio) {{
+          window.setTimeout(pollAudioStatus, 400);
         }}
       }});
     </script>
   </body>
 </html>
 """
+
+
+def run_audio_job(text: str, audio_name: str) -> None:
+    try:
+        synthesize_with_piper(text)
+    except RuntimeError as error:
+        mark_audio_error(audio_name, str(error))
+    finally:
+        with _AUDIO_JOB_LOCK:
+            _PENDING_AUDIO_JOBS.discard(audio_name)
+
+
+def queue_audio_synthesis(text: str) -> tuple[str, bool]:
+    audio_name = build_audio_name(text)
+    audio_path = get_audio_path(audio_name)
+
+    if audio_path.exists() and audio_path.stat().st_size > 0:
+        audio_path.touch()
+        cleanup_audio_cache()
+        clear_audio_error(audio_name)
+        return (audio_name, True)
+
+    with _AUDIO_JOB_LOCK:
+        _AUDIO_JOB_ERRORS.pop(audio_name, None)
+        if audio_name in _PENDING_AUDIO_JOBS:
+            return (audio_name, False)
+
+        _PENDING_AUDIO_JOBS.add(audio_name)
+
+    threading.Thread(target=run_audio_job, args=(text, audio_name), daemon=True).start()
+    return (audio_name, False)
 
 
 class VerseRequestHandler(BaseHTTPRequestHandler):
@@ -591,6 +776,10 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path.startswith("/audio/"):
             self.respond_audio(parsed.path.removeprefix("/audio/"))
+            return
+
+        if parsed.path.startswith("/audio-status/"):
+            self.respond_audio_status(parsed.path.removeprefix("/audio-status/"))
             return
 
         self.respond_not_found()
@@ -613,6 +802,10 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
             self.respond_audio(parsed.path.removeprefix("/audio/"), head_only=True)
             return
 
+        if parsed.path.startswith("/audio-status/"):
+            self.respond_audio_status(parsed.path.removeprefix("/audio-status/"), head_only=True)
+            return
+
         self.respond_not_found(head_only=True)
 
     def do_POST(self) -> None:
@@ -623,11 +816,13 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
         personalized_text = personalize_verse(first_name)
         piper_ready, piper_status = get_piper_status()
         audio_name = ""
+        audio_pending = False
         synthesis_error = ""
 
         if personalized_text and piper_ready:
             try:
-                audio_name = synthesize_with_piper(personalized_text)
+                audio_name, audio_ready = queue_audio_synthesis(personalized_text)
+                audio_pending = not audio_ready
             except RuntimeError as error:
                 synthesis_error = str(error)
 
@@ -636,6 +831,7 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
                 first_name=first_name,
                 personalized_text=personalized_text,
                 audio_name=audio_name,
+                audio_pending=audio_pending,
                 piper_ready=piper_ready,
                 piper_status=piper_status,
                 synthesis_error=synthesis_error,
@@ -651,7 +847,7 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
             self.respond_not_found(head_only=head_only)
             return
 
-        audio_path = AUDIO_DIR / audio_name
+        audio_path = get_audio_path(audio_name)
         if not audio_path.exists():
             self.respond_not_found(head_only=head_only)
             return
@@ -662,6 +858,27 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
             status_code=200,
             content_type="audio/wav",
             content_length=len(content),
+        )
+
+    def respond_audio_status(self, audio_name: str, head_only: bool = False) -> None:
+        if "/" in audio_name or "\\" in audio_name or not audio_name.endswith(".wav"):
+            self.respond_not_found(head_only=head_only)
+            return
+
+        status, message = get_audio_job_state(audio_name)
+        payload = {
+            "audio_name": audio_name,
+            "status": status,
+        }
+        if message:
+            payload["message"] = message
+
+        body = json.dumps(payload, ensure_ascii=False)
+        self.respond(
+            body="" if head_only else body,
+            status_code=200,
+            content_type="application/json; charset=utf-8",
+            content_length=len(body.encode("utf-8")),
         )
 
     def respond_not_found(self, head_only: bool = False) -> None:
