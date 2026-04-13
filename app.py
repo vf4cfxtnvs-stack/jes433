@@ -4,6 +4,7 @@ import hashlib
 import html
 import importlib.util
 import json
+import mimetypes
 import os
 import subprocess
 import sys
@@ -13,6 +14,8 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -22,6 +25,20 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 PROJECT_VENV_PYTHON = BASE_DIR / ".venv" / "bin" / "python"
 VERSE_REFERENCE = "Jesaja 43,1-4 (personalisiert)"
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "PF7ymFrAxu2Ooidu2xr3").strip()
+ELEVENLABS_MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+ELEVENLABS_OUTPUT_FORMAT = os.environ.get("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip()
+ELEVENLABS_LANGUAGE_CODE = os.environ.get("ELEVENLABS_LANGUAGE_CODE", "de").strip()
+ELEVENLABS_STABILITY = float(os.environ.get("ELEVENLABS_STABILITY", "0.68"))
+ELEVENLABS_SIMILARITY_BOOST = float(os.environ.get("ELEVENLABS_SIMILARITY_BOOST", "0.82"))
+ELEVENLABS_STYLE = float(os.environ.get("ELEVENLABS_STYLE", "0.08"))
+ELEVENLABS_SPEAKER_BOOST = os.environ.get("ELEVENLABS_SPEAKER_BOOST", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 PIPER_LENGTH_SCALE = float(os.environ.get("PIPER_LENGTH_SCALE", "1.0"))
 PIPER_SENTENCE_SILENCE = float(os.environ.get("PIPER_SENTENCE_SILENCE", "0.2"))
 PIPER_MODEL_PATH = Path(
@@ -38,6 +55,10 @@ _PIPER_SYNTHESIS_LOCK = threading.RLock()
 _AUDIO_JOB_LOCK = threading.Lock()
 _PENDING_AUDIO_JOBS: set[str] = set()
 _AUDIO_JOB_ERRORS: dict[str, str] = {}
+
+
+def using_elevenlabs() -> bool:
+    return bool(ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID)
 
 
 def personalize_verse(first_name: str) -> str:
@@ -106,12 +127,25 @@ def warm_piper_voice() -> None:
         return
 
 
-def get_piper_status() -> tuple[bool, str]:
+def get_tts_status() -> tuple[bool, str]:
+    if using_elevenlabs():
+        return (
+            True,
+            (
+                "ElevenLabs ist aktiv mit Stimme "
+                f"{ELEVENLABS_VOICE_ID}, Modell {ELEVENLABS_MODEL_ID}, "
+                f"Format {ELEVENLABS_OUTPUT_FORMAT}."
+            ),
+        )
+
     runner, runner_label = find_piper_runner()
     if runner is None:
         return (
             False,
-            "Piper ist noch nicht gefunden worden. Installiere es am besten in .venv.",
+            (
+                "ElevenLabs ist noch nicht eingerichtet und Piper wurde ebenfalls nicht "
+                "gefunden. Setze ELEVENLABS_API_KEY oder installiere Piper in .venv."
+            ),
         )
 
     if not PIPER_MODEL_PATH.exists():
@@ -129,7 +163,7 @@ def get_piper_status() -> tuple[bool, str]:
     return (
         True,
         (
-            "Piper ist aktiv mit dem Modell "
+            "Piper-Fallback ist aktiv mit dem Modell "
             f"{PIPER_MODEL_PATH.name} ueber "
             f"{'eingebettete Piper-API' if current_process_has_piper() else runner_label}. "
             f"Tempo={PIPER_LENGTH_SCALE}, Satzpause={PIPER_SENTENCE_SILENCE}s."
@@ -139,14 +173,40 @@ def get_piper_status() -> tuple[bool, str]:
 
 def cleanup_audio_cache(max_files: int = 12) -> None:
     AUDIO_DIR.mkdir(exist_ok=True)
-    wav_files = sorted(AUDIO_DIR.glob("*.wav"), key=lambda path: path.stat().st_mtime, reverse=True)
-    for stale_file in wav_files[max_files:]:
+    audio_files = sorted(
+        [
+            *AUDIO_DIR.glob("*.wav"),
+            *AUDIO_DIR.glob("*.mp3"),
+        ],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for stale_file in audio_files[max_files:]:
         stale_file.unlink(missing_ok=True)
 
 
 def build_audio_name(text: str) -> str:
+    if using_elevenlabs():
+        cache_key = "|".join(
+            [
+                "elevenlabs",
+                ELEVENLABS_VOICE_ID,
+                ELEVENLABS_MODEL_ID,
+                ELEVENLABS_OUTPUT_FORMAT,
+                ELEVENLABS_LANGUAGE_CODE,
+                str(ELEVENLABS_STABILITY),
+                str(ELEVENLABS_SIMILARITY_BOOST),
+                str(ELEVENLABS_STYLE),
+                str(ELEVENLABS_SPEAKER_BOOST),
+                text,
+            ]
+        )
+        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
+        return f"{digest}.{get_output_extension()}"
+
     cache_key = "|".join(
         [
+            "piper",
             PIPER_MODEL_PATH.name,
             str(PIPER_LENGTH_SCALE),
             str(PIPER_SENTENCE_SILENCE),
@@ -155,6 +215,12 @@ def build_audio_name(text: str) -> str:
     )
     digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
     return f"{digest}.wav"
+
+
+def get_output_extension() -> str:
+    if using_elevenlabs():
+        return ELEVENLABS_OUTPUT_FORMAT.split("_", 1)[0]
+    return "wav"
 
 
 def get_audio_path(audio_name: str) -> Path:
@@ -192,6 +258,20 @@ def get_audio_job_state(audio_name: str) -> tuple[str, str]:
     return ("pending", "")
 
 
+def get_audio_content_type(audio_name: str) -> str:
+    guessed_type, _ = mimetypes.guess_type(audio_name)
+    if guessed_type:
+        return guessed_type
+
+    if audio_name.endswith(".wav"):
+        return "audio/wav"
+
+    if audio_name.endswith(".mp3"):
+        return "audio/mpeg"
+
+    return "application/octet-stream"
+
+
 def synthesize_with_embedded_piper(text: str, output_path: Path) -> None:
     voice, syn_config = load_piper_voice()
     if (voice is None) or (syn_config is None):
@@ -214,6 +294,83 @@ def synthesize_with_embedded_piper(text: str, output_path: Path) -> None:
                     wav_file.writeframes(silence_bytes)
 
                 wav_file.writeframes(audio_chunk.audio_int16_bytes)
+
+
+def synthesize_with_elevenlabs(text: str, output_path: Path) -> None:
+    request_body = json.dumps(
+        {
+            "text": text,
+            "model_id": ELEVENLABS_MODEL_ID,
+            "language_code": ELEVENLABS_LANGUAGE_CODE,
+            "voice_settings": {
+                "stability": ELEVENLABS_STABILITY,
+                "similarity_boost": ELEVENLABS_SIMILARITY_BOOST,
+                "style": ELEVENLABS_STYLE,
+                "use_speaker_boost": ELEVENLABS_SPEAKER_BOOST,
+            },
+        }
+    ).encode("utf-8")
+
+    request = Request(
+        (
+            "https://api.elevenlabs.io/v1/text-to-speech/"
+            f"{ELEVENLABS_VOICE_ID}?output_format={ELEVENLABS_OUTPUT_FORMAT}"
+        ),
+        data=request_body,
+        headers={
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=180) as response:
+            audio_bytes = response.read()
+    except HTTPError as error:
+        error_payload = error.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(error_payload or f"ElevenLabs HTTP {error.code}") from error
+    except URLError as error:
+        raise RuntimeError(f"ElevenLabs konnte nicht erreicht werden: {error.reason}") from error
+
+    if not audio_bytes:
+        raise RuntimeError("ElevenLabs hat keine Audiodaten zurueckgegeben.")
+
+    output_path.write_bytes(audio_bytes)
+
+
+def synthesize_with_elevenlabs_or_cache(text: str) -> str:
+    AUDIO_DIR.mkdir(exist_ok=True)
+    output_name = build_audio_name(text)
+    output_path = get_audio_path(output_name)
+    temp_output_path = output_path.with_name(
+        f"{output_path.stem}.partial.{output_path.suffix.lstrip('.')}"
+    )
+
+    with _PIPER_SYNTHESIS_LOCK:
+        if output_path.exists() and output_path.stat().st_size > 0:
+            output_path.touch()
+            cleanup_audio_cache()
+            return output_name
+
+        cleanup_audio_cache()
+        temp_output_path.unlink(missing_ok=True)
+
+        try:
+            synthesize_with_elevenlabs(text, temp_output_path)
+            if (not temp_output_path.exists()) or temp_output_path.stat().st_size == 0:
+                raise RuntimeError("ElevenLabs hat keine gueltige Audiodatei erzeugt.")
+
+            temp_output_path.replace(output_path)
+        except Exception as error:
+            temp_output_path.unlink(missing_ok=True)
+            if isinstance(error, RuntimeError):
+                raise
+            raise RuntimeError(str(error)) from error
+
+    clear_audio_error(output_name)
+    return output_name
 
 
 def synthesize_with_piper(text: str) -> str:
@@ -275,8 +432,21 @@ def synthesize_with_piper(text: str) -> str:
     return output_name
 
 
+def synthesize_audio(text: str) -> str:
+    if using_elevenlabs():
+        return synthesize_with_elevenlabs_or_cache(text)
+    return synthesize_with_piper(text)
+
+
 def build_setup_hint() -> str:
-    return """python3 -m venv .venv
+    return """Mit ElevenLabs:
+ELEVENLABS_API_KEY=dein_api_key python3 app.py
+
+Optional:
+ELEVENLABS_VOICE_ID=PF7ymFrAxu2Ooidu2xr3
+
+Fallback mit Piper:
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install piper-tts
 python -m piper.download_voices de_DE-thorsten-medium --data-dir models
@@ -288,24 +458,24 @@ def build_page(
     personalized_text: str = "",
     audio_name: str = "",
     audio_pending: bool = False,
-    piper_ready: bool = False,
-    piper_status: str = "",
+    tts_ready: bool = False,
+    tts_status: str = "",
     synthesis_error: str = "",
 ) -> str:
     safe_name = html.escape(first_name)
     safe_personalized_text = html.escape(personalized_text)
-    safe_piper_status = html.escape(piper_status)
+    safe_tts_status = html.escape(tts_status)
     safe_synthesis_error = html.escape(synthesis_error)
     safe_setup_hint = html.escape(build_setup_hint())
 
-    status_class = "ok" if piper_ready else "warn"
+    status_class = "ok" if tts_ready else "warn"
     audio_block = ""
     audio_status_block = ""
     if audio_name and not audio_pending:
         safe_audio_name = html.escape(audio_name)
         audio_block = f"""
         <div class="audio-card">
-          <p class="audio-label">Piper-Audio</p>
+          <p class="audio-label">Audio</p>
           <audio id="piper-player" controls preload="auto" src="/audio/{safe_audio_name}"></audio>
           <div class="actions">
             <button type="button" onclick="playAudio()">Noch einmal abspielen</button>
@@ -325,16 +495,16 @@ def build_page(
     if synthesis_error:
         error_block = f"""
         <div class="status error">
-          <strong>Piper konnte das Audio nicht erzeugen.</strong>
+          <strong>Das Audio konnte nicht erzeugt werden.</strong>
           <p>{safe_synthesis_error}</p>
         </div>
         """
 
     setup_block = ""
-    if not piper_ready:
+    if not tts_ready:
         setup_block = f"""
         <div class="setup-box">
-          <p class="setup-title">Piper schnell einrichten</p>
+          <p class="setup-title">Audio-Engine einrichten</p>
           <pre>{safe_setup_hint}</pre>
         </div>
         """
@@ -355,7 +525,7 @@ def build_page(
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Personalisierter Bibelvers mit Piper</title>
+    <title>Personalisierter Bibelvers mit Audio</title>
     <style>
       :root {{
         --bg-top: #f7efe2;
@@ -576,12 +746,12 @@ def build_page(
       <h1>Ein Name. Ein Zuspruch.</h1>
       <p class="intro">
         Gib einen Vornamen ein. Danach wird dein personalisierter Text angezeigt
-        und mit Piper als Audiodatei erzeugt.
+        und als Audiodatei erzeugt.
       </p>
 
       <div class="status {status_class}">
-        <strong>Piper-Status</strong>
-        <p>{safe_piper_status}</p>
+        <strong>Audio-Status</strong>
+        <p>{safe_tts_status}</p>
       </div>
 
       {error_block}
@@ -628,7 +798,7 @@ def build_page(
       function buildAudioCard(audioName) {{
         return `
           <div class="audio-card">
-            <p class="audio-label">Piper-Audio</p>
+            <p class="audio-label">Audio</p>
             <audio id="piper-player" controls preload="auto" src="/audio/${{encodeURIComponent(audioName)}}"></audio>
             <div class="actions">
               <button type="button" onclick="playAudio()">Noch einmal abspielen</button>
@@ -734,7 +904,7 @@ def build_page(
 
 def run_audio_job(text: str, audio_name: str) -> None:
     try:
-        synthesize_with_piper(text)
+        synthesize_audio(text)
     except RuntimeError as error:
         mark_audio_error(audio_name, str(error))
     finally:
@@ -788,8 +958,8 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             body = build_page(
-                piper_ready=get_piper_status()[0],
-                piper_status=get_piper_status()[1],
+                tts_ready=get_tts_status()[0],
+                tts_status=get_tts_status()[1],
             )
             self.respond(body="", status_code=200, content_type="text/html; charset=utf-8", content_length=len(body.encode("utf-8")))
             return
@@ -814,12 +984,12 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
         form_data = parse_qs(raw_body)
         first_name = form_data.get("first_name", [""])[0].strip()
         personalized_text = personalize_verse(first_name)
-        piper_ready, piper_status = get_piper_status()
+        tts_ready, tts_status = get_tts_status()
         audio_name = ""
         audio_pending = False
         synthesis_error = ""
 
-        if personalized_text and piper_ready:
+        if personalized_text and tts_ready:
             try:
                 audio_name, audio_ready = queue_audio_synthesis(personalized_text)
                 audio_pending = not audio_ready
@@ -832,18 +1002,20 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
                 personalized_text=personalized_text,
                 audio_name=audio_name,
                 audio_pending=audio_pending,
-                piper_ready=piper_ready,
-                piper_status=piper_status,
+                tts_ready=tts_ready,
+                tts_status=tts_status,
                 synthesis_error=synthesis_error,
             )
         )
 
     def respond_home(self) -> None:
-        piper_ready, piper_status = get_piper_status()
-        self.respond(build_page(piper_ready=piper_ready, piper_status=piper_status))
+        tts_ready, tts_status = get_tts_status()
+        self.respond(build_page(tts_ready=tts_ready, tts_status=tts_status))
 
     def respond_audio(self, audio_name: str, head_only: bool = False) -> None:
-        if "/" in audio_name or "\\" in audio_name or not audio_name.endswith(".wav"):
+        if "/" in audio_name or "\\" in audio_name or not any(
+            audio_name.endswith(extension) for extension in (".wav", ".mp3")
+        ):
             self.respond_not_found(head_only=head_only)
             return
 
@@ -856,12 +1028,14 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
         self.respond(
             body=b"" if head_only else content,
             status_code=200,
-            content_type="audio/wav",
+            content_type=get_audio_content_type(audio_name),
             content_length=len(content),
         )
 
     def respond_audio_status(self, audio_name: str, head_only: bool = False) -> None:
-        if "/" in audio_name or "\\" in audio_name or not audio_name.endswith(".wav"):
+        if "/" in audio_name or "\\" in audio_name or not any(
+            audio_name.endswith(extension) for extension in (".wav", ".mp3")
+        ):
             self.respond_not_found(head_only=head_only)
             return
 
@@ -912,7 +1086,7 @@ class VerseRequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     AUDIO_DIR.mkdir(exist_ok=True)
-    if current_process_has_piper():
+    if (not using_elevenlabs()) and current_process_has_piper():
         threading.Thread(target=warm_piper_voice, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), VerseRequestHandler)
     print(f"Web-App gestartet: http://{HOST}:{PORT}")

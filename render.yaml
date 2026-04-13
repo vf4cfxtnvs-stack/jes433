@@ -12,6 +12,20 @@ services:
         value: 0.0.0.0
       - key: PORT
         value: 10000
+      - key: ELEVENLABS_VOICE_ID
+        value: PF7ymFrAxu2Ooidu2xr3
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_multilingual_v2
+      - key: ELEVENLABS_OUTPUT_FORMAT
+        value: mp3_44100_128
+      - key: ELEVENLABS_STABILITY
+        value: 0.68
+      - key: ELEVENLABS_SIMILARITY_BOOST
+        value: 0.82
+      - key: ELEVENLABS_STYLE
+        value: 0.08
+      - key: ELEVENLABS_SPEAKER_BOOST
+        value: "true"
       - key: PIPER_MODEL_PATH
         value: models/de_DE-thorsten-medium.onnx
       - key: PIPER_LENGTH_SCALE

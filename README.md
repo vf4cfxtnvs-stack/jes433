@@ -1,8 +1,32 @@
-# Personalisierter Bibeltext mit Piper
+# Personalisierter Bibeltext mit ElevenLabs oder Piper
 
 Diese kleine Web-App nimmt einen Vornamen entgegen, erzeugt daraus deinen
-personalisierten Text nach Jesaja 43,1-4 und laesst ihn mit Piper als echte
-Audiodatei sprechen.
+personalisierten Text nach Jesaja 43,1-4 und laesst ihn wahlweise mit
+ElevenLabs oder Piper als echte Audiodatei sprechen.
+
+## ElevenLabs aktivieren
+
+Empfohlen fuer bessere Stimmen:
+
+```bash
+export ELEVENLABS_API_KEY="dein_api_key"
+export ELEVENLABS_VOICE_ID="PF7ymFrAxu2Ooidu2xr3"
+python3 app.py
+```
+
+Optional kannst du die Voreinstellungen anpassen:
+
+```bash
+export ELEVENLABS_MODEL_ID="eleven_multilingual_v2"
+export ELEVENLABS_OUTPUT_FORMAT="mp3_44100_128"
+export ELEVENLABS_STABILITY="0.68"
+export ELEVENLABS_SIMILARITY_BOOST="0.82"
+export ELEVENLABS_STYLE="0.08"
+export ELEVENLABS_SPEAKER_BOOST="true"
+```
+
+Wenn `ELEVENLABS_API_KEY` nicht gesetzt ist, faellt die App automatisch auf
+Piper zurueck.
 
 ## Piper einrichten
 
