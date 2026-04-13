@@ -12,11 +12,11 @@ Im Projektordner:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install piper-tts
-python -m piper.download_voices de_DE-thorsten-high --data-dir models
+python -m piper.download_voices de_DE-thorsten-medium --data-dir models
 ```
 
-Danach liegen das Modell `de_DE-thorsten-high.onnx` und die zugehoerige
-`de_DE-thorsten-high.onnx.json` unter `models/`.
+Danach liegen das Modell `de_DE-thorsten-medium.onnx` und die zugehoerige
+`de_DE-thorsten-medium.onnx.json` unter `models/`.
 
 ## Starten
 

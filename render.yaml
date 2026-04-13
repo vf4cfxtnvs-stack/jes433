@@ -13,7 +13,7 @@ services:
       - key: PORT
         value: 10000
       - key: PIPER_MODEL_PATH
-        value: models/de_DE-thorsten-high.onnx
+        value: models/de_DE-thorsten-medium.onnx
       - key: PIPER_LENGTH_SCALE
         value: 1.15
       - key: PIPER_SENTENCE_SILENCE

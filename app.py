@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "generated_audio"
-DEFAULT_VOICE = "de_DE-thorsten-high"
+DEFAULT_VOICE = "de_DE-thorsten-medium"
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 PROJECT_VENV_PYTHON = BASE_DIR / ".venv" / "bin" / "python"
@@ -279,7 +279,7 @@ def build_setup_hint() -> str:
     return """python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install piper-tts
-python -m piper.download_voices de_DE-thorsten-high --data-dir models
+python -m piper.download_voices de_DE-thorsten-medium --data-dir models
 python app.py"""
 
 
